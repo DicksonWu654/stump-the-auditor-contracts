@@ -1,0 +1,732 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+
+import {IVault} from "./interfaces/IVault.sol";
+
+/// @title Multi-asset vault with fee accrual and withdrawal timelocks
+/// @notice Deposits and withdrawal requests are blocked while paused, but claim and cancel remain available so users can
+///         always exit pending positions.
+/// @notice Yield reports pull whitelisted assets into the vault, so managed-asset accounting never gets ahead of live
+///         balances.
+/// @dev Pending withdrawals are excluded from active share accounting so burning shares into a timelocked claim does not
+///      masquerade as yield for remaining shareholders. Future reported yield is split between active capital and pending
+///      claims pro rata; the pending-side net yield is written directly into each request while the active side continues
+///      through the per-share high-water-mark path.
+contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
+    uint256 public constant WAD = 1e18;
+    uint256 public constant BPS = 10_000;
+    uint256 public constant MAX_MANAGEMENT_FEE_BPS = 500;
+    uint256 public constant MAX_PERFORMANCE_FEE_BPS = 3_000;
+    uint256 public constant MAX_TIMELOCK_BLOCKS = 7 days / 12;
+    uint256 public constant MIN_INITIAL_DEPOSIT = 1e6;
+    uint256 public constant VIRTUAL_SHARES_OFFSET = 1e3;
+    uint256 public constant SECONDS_PER_YEAR = 365 days;
+
+    uint256 private constant PPS_SCALE = WAD * VIRTUAL_SHARES_OFFSET;
+
+    struct AssetConfig {
+        bool enabled;
+        uint8 decimals;
+        uint256 totalHeld;
+    }
+
+    mapping(address => AssetConfig) public assetConfig;
+    address[] public assetList;
+    mapping(address => uint256) public userShares;
+    uint256 public totalShares;
+    uint256 public totalManagedWad;
+    mapping(address => WithdrawRequest) public pendingWithdraw;
+    mapping(address => uint256) public reservedForWithdraw;
+
+    uint256 public performanceFeeBps;
+    uint256 public managementFeeBps;
+    uint256 public lastFeeAccrual;
+    uint256 public highWaterMarkPPS;
+    address public feeRecipient;
+
+    uint256 public timelockBlocks;
+
+    uint256 internal totalPendingWithdrawWad;
+    mapping(address => uint256) private _assetIndexPlusOne;
+    address[] private _pendingUsers;
+    mapping(address => uint256) private _pendingUserIndexPlusOne;
+
+    /// @notice Sets the initial fee recipient and fee parameters.
+    /// @param feeRecipient_ The address that receives fee shares.
+    /// @param performanceFeeBps_ The initial performance fee, in basis points.
+    /// @param managementFeeBps_ The initial annualized management fee, in basis points.
+    /// @param timelockBlocks_ The initial withdrawal timelock, in blocks.
+    constructor(address feeRecipient_, uint256 performanceFeeBps_, uint256 managementFeeBps_, uint256 timelockBlocks_)
+        Ownable(msg.sender)
+    {
+        if (feeRecipient_ == address(0)) revert ZeroAddress();
+        if (performanceFeeBps_ > MAX_PERFORMANCE_FEE_BPS) {
+            revert FeeTooHigh(performanceFeeBps_, MAX_PERFORMANCE_FEE_BPS);
+        }
+        if (managementFeeBps_ > MAX_MANAGEMENT_FEE_BPS) {
+            revert FeeTooHigh(managementFeeBps_, MAX_MANAGEMENT_FEE_BPS);
+        }
+        if (timelockBlocks_ > MAX_TIMELOCK_BLOCKS) revert TimelockTooLong(timelockBlocks_, MAX_TIMELOCK_BLOCKS);
+
+        feeRecipient = feeRecipient_;
+        performanceFeeBps = performanceFeeBps_;
+        managementFeeBps = managementFeeBps_;
+        timelockBlocks = timelockBlocks_;
+        lastFeeAccrual = block.timestamp;
+    }
+
+    /// @notice Deposits a whitelisted asset and mints vault shares to the receiver.
+    /// @dev Share minting rounds down in favor of the vault. The first deposit must clear the minimum seed threshold.
+    /// @param asset The whitelisted asset to deposit.
+    /// @param amount The token-native amount to deposit.
+    /// @param receiver The account that receives the newly minted shares.
+    /// @return sharesMinted The number of shares minted to `receiver`.
+    function deposit(address asset, uint256 amount, address receiver)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (uint256 sharesMinted)
+    {
+        _accrueFees();
+
+        if (amount == 0) revert ZeroAmount();
+        if (receiver == address(0)) revert ZeroAddress();
+
+        AssetConfig storage config = _requireWhitelistedAsset(asset);
+        bool initializingSupply = totalShares == 0;
+        if (initializingSupply && amount < MIN_INITIAL_DEPOSIT) {
+            revert InitialDepositTooSmall(amount, MIN_INITIAL_DEPOSIT);
+        }
+
+        IERC20 assetToken = IERC20(asset);
+        uint256 balanceBefore = assetToken.balanceOf(address(this));
+        assetToken.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 balanceAfter = assetToken.balanceOf(address(this));
+        uint256 received = balanceAfter - balanceBefore;
+        if (received != amount) revert UnsupportedToken(asset);
+
+        uint256 amountWad = _toWad(received, config.decimals);
+        if (amountWad == 0) revert ZeroAmount();
+        uint256 activeManagedWad = _activeManagedWad();
+        sharesMinted = _computeShares(amountWad, totalShares, activeManagedWad);
+
+        totalManagedWad += amountWad;
+        totalShares += sharesMinted;
+        userShares[receiver] += sharesMinted;
+        config.totalHeld = balanceAfter;
+
+        if (initializingSupply && highWaterMarkPPS == 0) {
+            highWaterMarkPPS = WAD;
+        }
+
+        emit Deposited(msg.sender, asset, received, sharesMinted, receiver);
+    }
+
+    /// @notice Burns shares into a timelocked withdrawal claim denominated in a chosen asset.
+    /// @dev The request freezes the caller's share count and initial WAD claim. While active capital still exists,
+    ///      future `reportYield` calls split realized profit between active shares and pending requests pro rata to
+    ///      their pre-report exposure; the pending side accrues its net-of-performance-fee share directly into
+    ///      `wadOwed` and `reservedAmount`.
+    /// @param shares The number of shares to burn into the request.
+    /// @param asset The whitelisted asset to be received on claim.
+    /// @return unlockBlock The first block at which the withdrawal may be claimed.
+    function requestWithdraw(uint256 shares, address asset)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (uint64 unlockBlock)
+    {
+        _accrueFees();
+
+        if (shares == 0) revert ZeroAmount();
+        AssetConfig storage config = _requireWhitelistedAsset(asset);
+
+        WithdrawRequest storage existingRequest = pendingWithdraw[msg.sender];
+        if (existingRequest.shares != 0) revert PendingWithdrawExists(msg.sender);
+
+        uint256 availableShares = userShares[msg.sender];
+        if (shares > availableShares) revert InsufficientShares(shares, availableShares);
+
+        uint256 wadOwed = _computeAssets(shares, totalShares, _activeManagedWad());
+        uint256 reservedAmount = _fromWad(wadOwed, config.decimals);
+        if (wadOwed != 0 && reservedAmount == 0) revert ZeroAmount();
+        uint256 availableLiquidity = _syncTrackedHoldings(asset, config);
+        uint256 alreadyReserved = reservedForWithdraw[asset];
+        uint256 unreservedLiquidity = availableLiquidity > alreadyReserved ? availableLiquidity - alreadyReserved : 0;
+        if (reservedAmount > unreservedLiquidity) {
+            revert InsufficientAssetLiquidity(asset, reservedAmount, unreservedLiquidity);
+        }
+
+        userShares[msg.sender] = availableShares - shares;
+        totalShares -= shares;
+        totalPendingWithdrawWad += wadOwed;
+        reservedForWithdraw[asset] = alreadyReserved + reservedAmount;
+
+        unlockBlock = uint64(block.number + timelockBlocks);
+        pendingWithdraw[msg.sender] = WithdrawRequest({
+            shares: shares,
+            wadOwed: wadOwed,
+            reservedAmount: reservedAmount,
+            asset: asset,
+            unlockBlock: unlockBlock,
+            claimed: false
+        });
+        _addPendingUser(msg.sender);
+
+        emit WithdrawRequested(msg.sender, shares, wadOwed, asset, unlockBlock);
+    }
+
+    /// @notice Claims an unlocked withdrawal request in the asset chosen at request time.
+    /// @return amountOut The token-native amount transferred to the caller.
+    function claimWithdraw() external nonReentrant returns (uint256 amountOut) {
+        _accrueFees();
+
+        WithdrawRequest memory request = pendingWithdraw[msg.sender];
+        if (request.shares == 0) revert NoPendingWithdraw(msg.sender);
+        if (block.number < request.unlockBlock) revert TimelockActive(request.unlockBlock, uint64(block.number));
+
+        AssetConfig storage config = assetConfig[request.asset];
+        uint256 availableLiquidity = _syncTrackedHoldings(request.asset, config);
+        amountOut = request.reservedAmount;
+        if (amountOut > availableLiquidity) {
+            revert InsufficientAssetLiquidity(request.asset, amountOut, availableLiquidity);
+        }
+
+        totalManagedWad -= request.wadOwed;
+        totalPendingWithdrawWad -= request.wadOwed;
+        reservedForWithdraw[request.asset] -= request.reservedAmount;
+        config.totalHeld = availableLiquidity - amountOut;
+
+        _removePendingUser(msg.sender);
+        delete pendingWithdraw[msg.sender];
+
+        IERC20(request.asset).safeTransfer(msg.sender, amountOut);
+
+        emit WithdrawClaimed(msg.sender, request.asset, amountOut);
+    }
+
+    /// @notice Cancels a pending withdrawal and restores the original burned shares.
+    /// @dev Cancels are only allowed before the request becomes claimable to avoid post-unlock optionality.
+    ///      Restoring the original share count prevents request-wait-cancel management-fee dodging by making the
+    ///      canceller rejoin the diluted share supply instead of repricing back in at the lower post-fee PPS.
+    function cancelWithdraw() external nonReentrant {
+        _accrueFees();
+
+        WithdrawRequest memory request = pendingWithdraw[msg.sender];
+        if (request.shares == 0) revert NoPendingWithdraw(msg.sender);
+        if (block.number >= request.unlockBlock) revert TimelockActive(request.unlockBlock, uint64(block.number));
+
+        totalPendingWithdrawWad -= request.wadOwed;
+        reservedForWithdraw[request.asset] -= request.reservedAmount;
+        userShares[msg.sender] += request.shares;
+        totalShares += request.shares;
+
+        _removePendingUser(msg.sender);
+        delete pendingWithdraw[msg.sender];
+
+        emit WithdrawCancelled(msg.sender, request.shares);
+    }
+
+    /// @notice Returns the total managed assets tracked by the vault, in WAD.
+    /// @return assetsWad The vault's total managed assets, including pending withdrawal liabilities.
+    function totalAssets() external view returns (uint256 assetsWad) {
+        return totalManagedWad;
+    }
+
+    /// @notice Converts a WAD-denominated asset amount into shares at the post-fee ratio.
+    /// @param amountWad The WAD-denominated asset amount.
+    /// @return shares The number of shares that amount would mint.
+    function convertToShares(uint256 amountWad) external view returns (uint256 shares) {
+        if (amountWad == 0) return 0;
+
+        (uint256 activeManagedWad, uint256 effectiveTotalShares,,,) = _pendingFees();
+        return _computeShares(amountWad, effectiveTotalShares, activeManagedWad);
+    }
+
+    /// @notice Converts shares into WAD-denominated assets at the post-fee ratio.
+    /// @param shares The number of shares to convert.
+    /// @return amountWad The WAD-denominated asset value for those shares.
+    function convertToAssets(uint256 shares) external view returns (uint256 amountWad) {
+        if (shares == 0) return 0;
+
+        (uint256 activeManagedWad, uint256 effectiveTotalShares,,,) = _pendingFees();
+        return _computeAssets(shares, effectiveTotalShares, activeManagedWad);
+    }
+
+    /// @notice Quotes a deposit using the post-fee share ratio.
+    /// @param asset The whitelisted asset to quote.
+    /// @param amount The token-native deposit amount.
+    /// @return shares The number of shares that deposit would mint.
+    function previewDeposit(address asset, uint256 amount) external view returns (uint256 shares) {
+        if (amount == 0) return 0;
+
+        AssetConfig storage config = _requireWhitelistedAsset(asset);
+        uint256 amountWad = _toWad(amount, config.decimals);
+        (uint256 activeManagedWad, uint256 effectiveTotalShares,,,) = _pendingFees();
+        return _computeShares(amountWad, effectiveTotalShares, activeManagedWad);
+    }
+
+    /// @notice Quotes the WAD-denominated assets owed for a withdrawal request using the post-fee ratio.
+    /// @param shares The number of shares to burn.
+    /// @return amountWad The WAD-denominated asset value the request would lock in.
+    function previewWithdraw(uint256 shares) external view returns (uint256 amountWad) {
+        if (shares == 0) return 0;
+
+        (uint256 activeManagedWad, uint256 effectiveTotalShares,,,) = _pendingFees();
+        return _computeAssets(shares, effectiveTotalShares, activeManagedWad);
+    }
+
+    /// @notice Returns the currently whitelisted asset list.
+    /// @return assets The whitelisted assets.
+    function getAssetList() external view returns (address[] memory assets) {
+        return assetList;
+    }
+
+    /// @notice Returns the caller-facing pending withdrawal record for a user.
+    /// @param user The user to inspect.
+    /// @return request The stored pending withdrawal request.
+    function getPendingWithdraw(address user) external view returns (WithdrawRequest memory request) {
+        return pendingWithdraw[user];
+    }
+
+    /// @notice Whitelists an asset for future deposits and withdrawals.
+    /// @param asset The ERC20 asset to whitelist.
+    function addAsset(address asset) external onlyOwner {
+        _accrueFees();
+
+        if (asset == address(0)) revert ZeroAddress();
+        if (assetConfig[asset].enabled) revert AssetAlreadyWhitelisted(asset);
+
+        AssetConfig storage config = assetConfig[asset];
+        uint8 decimals = IERC20Metadata(asset).decimals();
+        if (decimals > 36) revert UnsupportedToken(asset);
+
+        config.enabled = true;
+        config.decimals = decimals;
+
+        assetList.push(asset);
+        _assetIndexPlusOne[asset] = assetList.length;
+
+        emit AssetAdded(asset, config.decimals);
+    }
+
+    /// @notice Removes an asset from the whitelist after all tracked liquidity has been drained.
+    /// @param asset The whitelisted asset to remove.
+    function removeAsset(address asset) external onlyOwner {
+        _accrueFees();
+
+        AssetConfig storage config = _requireWhitelistedAsset(asset);
+        uint256 held = _syncTrackedHoldings(asset, config);
+        if (held != 0) revert AssetStillHeld(asset, held);
+
+        config.enabled = false;
+        _removeAssetFromList(asset);
+
+        emit AssetRemoved(asset);
+    }
+
+    /// @notice Sets the performance fee that applies to PPS gains above the high water mark.
+    /// @param bps The new performance fee, in basis points.
+    function setPerformanceFee(uint256 bps) external onlyOwner {
+        _accrueFees();
+
+        if (bps > MAX_PERFORMANCE_FEE_BPS) revert FeeTooHigh(bps, MAX_PERFORMANCE_FEE_BPS);
+        performanceFeeBps = bps;
+
+        emit FeeParamsUpdated(performanceFeeBps, managementFeeBps);
+    }
+
+    /// @notice Sets the annualized management fee.
+    /// @param bps The new management fee, in basis points.
+    function setManagementFee(uint256 bps) external onlyOwner {
+        _accrueFees();
+
+        if (bps > MAX_MANAGEMENT_FEE_BPS) revert FeeTooHigh(bps, MAX_MANAGEMENT_FEE_BPS);
+        managementFeeBps = bps;
+
+        emit FeeParamsUpdated(performanceFeeBps, managementFeeBps);
+    }
+
+    /// @notice Sets the withdrawal timelock.
+    /// @param blocks_ The new timelock, in blocks.
+    function setTimelockBlocks(uint256 blocks_) external onlyOwner {
+        _accrueFees();
+
+        if (blocks_ > MAX_TIMELOCK_BLOCKS) revert TimelockTooLong(blocks_, MAX_TIMELOCK_BLOCKS);
+        timelockBlocks = blocks_;
+
+        emit TimelockUpdated(blocks_);
+    }
+
+    /// @notice Sets the address that receives newly minted fee shares.
+    /// @dev Existing fee shares remain at the previous recipient address. Rotations only affect future accrual.
+    /// @param recipient The new fee recipient.
+    function setFeeRecipient(address recipient) external onlyOwner {
+        _accrueFees();
+
+        if (recipient == address(0)) revert ZeroAddress();
+        feeRecipient = recipient;
+
+        emit FeeRecipientUpdated(recipient);
+    }
+
+    /// @notice Pulls whitelisted strategy profits into the vault and adds them to managed assets.
+    /// @dev Pull-based accounting keeps managed assets aligned with live balances. Realized profit is split between the
+    ///      active pool and pending withdrawal liabilities in proportion to their pre-report exposure. The active share
+    ///      continues through the high-water-mark path, while the pending-side performance fee is crystallized
+    ///      immediately into fee-recipient shares so active PPS stays tied to the active-yield allocation only.
+    /// @param asset The whitelisted asset being realized as profit.
+    /// @param amount The token-native profit amount to pull from the owner.
+    function reportYield(address asset, uint256 amount) external onlyOwner {
+        _accrueFees();
+
+        if (amount == 0) revert ZeroAmount();
+        uint256 activeManagedWad = _activeManagedWad();
+        if (totalShares == 0 || activeManagedWad == 0) revert NoActiveShares();
+
+        AssetConfig storage config = _requireWhitelistedAsset(asset);
+        IERC20 assetToken = IERC20(asset);
+        uint256 balanceBefore = assetToken.balanceOf(address(this));
+        assetToken.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 balanceAfter = assetToken.balanceOf(address(this));
+        uint256 received = balanceAfter - balanceBefore;
+        if (received != amount) revert UnsupportedToken(asset);
+
+        uint256 amountWad = _toWad(received, config.decimals);
+        if (amountWad == 0) revert ZeroAmount();
+
+        uint256 activeShareSupply = totalShares;
+        uint256 pendingManagedWad = totalPendingWithdrawWad;
+        uint256 totalExposedWad = activeManagedWad + pendingManagedWad;
+        uint256 activeYieldWad = Math.mulDiv(amountWad, activeManagedWad, totalExposedWad, Math.Rounding.Floor);
+        uint256 pendingYieldWad = amountWad - activeYieldWad;
+
+        uint256 pendingPerfFeeWad;
+        if (pendingYieldWad != 0 && performanceFeeBps != 0 && activeYieldWad != 0) {
+            (, uint256 activeProfitAboveHwmWad) =
+                _profitAboveHighWaterMarkWad(activeManagedWad + activeYieldWad, activeShareSupply, highWaterMarkPPS);
+            if (activeProfitAboveHwmWad != 0) {
+                uint256 pendingProfitAboveHwmWad =
+                    Math.mulDiv(pendingYieldWad, activeProfitAboveHwmWad, activeYieldWad, Math.Rounding.Floor);
+                pendingPerfFeeWad = Math.mulDiv(pendingProfitAboveHwmWad, performanceFeeBps, BPS, Math.Rounding.Floor);
+            }
+        }
+
+        totalManagedWad += amountWad;
+        config.totalHeld = balanceAfter;
+        _allocatePendingYield(pendingYieldWad - pendingPerfFeeWad);
+        _mintPendingPerformanceFeeShares(pendingPerfFeeWad, activeShareSupply, activeManagedWad + activeYieldWad);
+
+        emit YieldReported(asset, received, totalManagedWad);
+    }
+
+    /// @notice Accrues any pending management and performance fees.
+    function accrueFees() external {
+        _accrueFees();
+    }
+
+    /// @notice Pauses new exposure-creating entry points.
+    function pause() external onlyOwner {
+        _accrueFees();
+        _pause();
+    }
+
+    /// @notice Unpauses new exposure-creating entry points.
+    function unpause() external onlyOwner {
+        _accrueFees();
+        _unpause();
+    }
+
+    /// @notice Accrues management fees first, then performance fees against active-PPS gains over the high water mark.
+    /// @dev PPS is measured against active managed assets only, excluding timelocked withdrawal liabilities, so deposits,
+    ///      cancellations, and claim finalization preserve PPS up to round-down dust instead of appearing as new profit.
+    ///      Pending-side yield and its associated performance fee are handled inside `reportYield`, leaving this path to
+    ///      price only the active-share portion against active managed assets.
+    function _accrueFees() internal {
+        uint256 currentTime = block.timestamp;
+        if (totalShares == 0) {
+            lastFeeAccrual = currentTime;
+            return;
+        }
+
+        (,, uint256 mgmtFeeShares, uint256 perfFeeShares, uint256 newHighWaterMarkPPS) = _pendingFees();
+
+        if (mgmtFeeShares != 0) {
+            userShares[feeRecipient] += mgmtFeeShares;
+            totalShares += mgmtFeeShares;
+        }
+        if (perfFeeShares != 0) {
+            userShares[feeRecipient] += perfFeeShares;
+            totalShares += perfFeeShares;
+        }
+        if (newHighWaterMarkPPS > highWaterMarkPPS) {
+            highWaterMarkPPS = newHighWaterMarkPPS;
+        }
+
+        lastFeeAccrual = currentTime;
+
+        if (mgmtFeeShares != 0 || perfFeeShares != 0) {
+            emit FeesAccrued(mgmtFeeShares, perfFeeShares, highWaterMarkPPS);
+        }
+    }
+
+    /// @notice Computes the fees that would accrue if `_accrueFees()` ran at the current timestamp.
+    /// @return activeManagedWad The managed assets that still back active shares.
+    /// @return effectiveTotalShares The share supply after simulated fee minting.
+    /// @return mgmtFeeShares The management fee shares that would mint.
+    /// @return perfFeeShares The performance fee shares that would mint.
+    /// @return newHighWaterMarkPPS The high water mark that would be stored.
+    function _pendingFees()
+        internal
+        view
+        returns (
+            uint256 activeManagedWad,
+            uint256 effectiveTotalShares,
+            uint256 mgmtFeeShares,
+            uint256 perfFeeShares,
+            uint256 newHighWaterMarkPPS
+        )
+    {
+        activeManagedWad = _activeManagedWad();
+        effectiveTotalShares = totalShares;
+        newHighWaterMarkPPS = highWaterMarkPPS;
+
+        if (effectiveTotalShares == 0) return (activeManagedWad, effectiveTotalShares, 0, 0, newHighWaterMarkPPS);
+
+        uint256 dt = block.timestamp - lastFeeAccrual;
+        if (dt != 0 && managementFeeBps != 0) {
+            mgmtFeeShares =
+                Math.mulDiv(effectiveTotalShares, managementFeeBps * dt, BPS * SECONDS_PER_YEAR, Math.Rounding.Floor);
+            effectiveTotalShares += mgmtFeeShares;
+        }
+
+        (uint256 currentPPS, uint256 profitWad) =
+            _profitAboveHighWaterMarkWad(activeManagedWad, effectiveTotalShares, newHighWaterMarkPPS);
+        if (profitWad != 0) {
+            uint256 perfFeeWad = Math.mulDiv(profitWad, performanceFeeBps, BPS, Math.Rounding.Floor);
+            perfFeeShares = _computeShares(perfFeeWad, effectiveTotalShares, activeManagedWad);
+            effectiveTotalShares += perfFeeShares;
+            newHighWaterMarkPPS = currentPPS;
+        }
+    }
+
+    /// @notice Returns the gross WAD profit above a reference high-water-mark PPS.
+    /// @param managedWad The managed assets backing the active pool.
+    /// @param shareSupply The active share supply.
+    /// @param referencePPS The PPS threshold that profit must exceed.
+    /// @return currentPPS The current active PPS before any new performance-fee shares mint.
+    /// @return profitWad The WAD profit that sits above `referencePPS`.
+    function _profitAboveHighWaterMarkWad(uint256 managedWad, uint256 shareSupply, uint256 referencePPS)
+        internal
+        pure
+        returns (uint256 currentPPS, uint256 profitWad)
+    {
+        currentPPS = _currentPPS(managedWad, shareSupply);
+        if (currentPPS <= referencePPS) return (currentPPS, 0);
+
+        profitWad = Math.mulDiv(currentPPS - referencePPS, shareSupply, PPS_SCALE, Math.Rounding.Floor);
+    }
+
+    /// @notice Allocates the pending share of a reported yield across all live withdrawal requests.
+    /// @param pendingNetYieldWad The WAD yield owed to pending requests after the pending-side perf fee.
+    function _allocatePendingYield(uint256 pendingNetYieldWad) internal {
+        uint256 pendingCount = _pendingUsers.length;
+        if (pendingNetYieldWad == 0 || pendingCount == 0 || totalPendingWithdrawWad == 0) return;
+
+        uint256 pendingBefore = totalPendingWithdrawWad;
+        uint256 remainingYieldWad = pendingNetYieldWad;
+        uint256 remainderRecipientIndex = pendingCount;
+
+        for (uint256 i; i < pendingCount; ++i) {
+            if (pendingWithdraw[_pendingUsers[i]].wadOwed != 0) {
+                remainderRecipientIndex = i;
+            }
+        }
+
+        for (uint256 i; i < pendingCount; ++i) {
+            address user = _pendingUsers[i];
+            WithdrawRequest storage request = pendingWithdraw[user];
+            uint256 userYieldWad = i == remainderRecipientIndex
+                ? remainingYieldWad
+                : Math.mulDiv(pendingNetYieldWad, request.wadOwed, pendingBefore, Math.Rounding.Floor);
+            remainingYieldWad -= userYieldWad;
+            if (userYieldWad == 0) continue;
+
+            AssetConfig storage config = assetConfig[request.asset];
+            uint256 updatedWadOwed = request.wadOwed + userYieldWad;
+            uint256 updatedReservedAmount = _fromWad(updatedWadOwed, config.decimals);
+            uint256 reservedDelta = updatedReservedAmount - request.reservedAmount;
+
+            if (reservedDelta != 0) {
+                uint256 availableLiquidity = _syncTrackedHoldings(request.asset, config);
+                uint256 alreadyReserved = reservedForWithdraw[request.asset];
+                uint256 unreservedLiquidity =
+                    availableLiquidity > alreadyReserved ? availableLiquidity - alreadyReserved : 0;
+                if (reservedDelta > unreservedLiquidity) {
+                    revert InsufficientAssetLiquidity(request.asset, reservedDelta, unreservedLiquidity);
+                }
+
+                reservedForWithdraw[request.asset] = alreadyReserved + reservedDelta;
+            }
+
+            request.wadOwed = updatedWadOwed;
+            request.reservedAmount = updatedReservedAmount;
+        }
+
+        totalPendingWithdrawWad = pendingBefore + pendingNetYieldWad;
+    }
+
+    /// @notice Mints fee-recipient shares against the pending side's realized performance fee.
+    /// @param pendingPerfFeeWad The WAD fee owed by pending withdrawal liabilities.
+    /// @param activeShareSupply The active share supply before minting the pending-side fee shares.
+    /// @param activeManagedWad The active managed assets before adding the pending-side fee itself.
+    function _mintPendingPerformanceFeeShares(
+        uint256 pendingPerfFeeWad,
+        uint256 activeShareSupply,
+        uint256 activeManagedWad
+    ) internal {
+        if (pendingPerfFeeWad == 0) return;
+
+        uint256 pendingPerfFeeShares = _computeShares(pendingPerfFeeWad, activeShareSupply, activeManagedWad);
+        if (pendingPerfFeeShares == 0) return;
+
+        userShares[feeRecipient] += pendingPerfFeeShares;
+        totalShares += pendingPerfFeeShares;
+    }
+
+    /// @notice Converts a token-native amount into WAD.
+    /// @param amount The token-native amount.
+    /// @param decimals The token decimals.
+    /// @return wadAmount The WAD-denominated amount.
+    function _toWad(uint256 amount, uint8 decimals) internal pure returns (uint256 wadAmount) {
+        if (decimals == 18) return amount;
+        if (decimals < 18) {
+            return Math.mulDiv(amount, 10 ** (18 - decimals), 1, Math.Rounding.Floor);
+        }
+        return Math.mulDiv(amount, 1, 10 ** (decimals - 18), Math.Rounding.Floor);
+    }
+
+    /// @notice Converts a WAD amount into token-native units.
+    /// @param wadAmount The WAD-denominated amount.
+    /// @param decimals The token decimals.
+    /// @return amount The token-native amount.
+    function _fromWad(uint256 wadAmount, uint8 decimals) internal pure returns (uint256 amount) {
+        if (decimals == 18) return wadAmount;
+        if (decimals < 18) {
+            return Math.mulDiv(wadAmount, 1, 10 ** (18 - decimals), Math.Rounding.Floor);
+        }
+        return Math.mulDiv(wadAmount, 10 ** (decimals - 18), 1, Math.Rounding.Floor);
+    }
+
+    /// @notice Computes shares for a WAD deposit amount under the virtual-offset share model.
+    /// @param amountWad The WAD amount to convert.
+    /// @param shareSupply The share supply to use for the conversion.
+    /// @param managedWad The managed assets backing those shares.
+    /// @return shares The computed share amount, rounded down.
+    function _computeShares(uint256 amountWad, uint256 shareSupply, uint256 managedWad)
+        internal
+        pure
+        returns (uint256 shares)
+    {
+        return Math.mulDiv(amountWad, shareSupply + VIRTUAL_SHARES_OFFSET, managedWad + 1, Math.Rounding.Floor);
+    }
+
+    /// @notice Computes WAD-denominated assets for a share amount under the virtual-offset share model.
+    /// @param shares The share amount to convert.
+    /// @param shareSupply The share supply to use for the conversion.
+    /// @param managedWad The managed assets backing those shares.
+    /// @return amountWad The computed WAD amount, rounded down.
+    function _computeAssets(uint256 shares, uint256 shareSupply, uint256 managedWad)
+        internal
+        pure
+        returns (uint256 amountWad)
+    {
+        return Math.mulDiv(shares, managedWad + 1, shareSupply + VIRTUAL_SHARES_OFFSET, Math.Rounding.Floor);
+    }
+
+    /// @notice Returns the WAD-scaled assets-per-normalized-share value used by the high water mark.
+    /// @param managedWad The managed assets backing active shares.
+    /// @param shareSupply The active share supply.
+    /// @return pps The current PPS value scaled by `WAD`.
+    function _currentPPS(uint256 managedWad, uint256 shareSupply) internal pure returns (uint256 pps) {
+        return Math.mulDiv(managedWad + 1, PPS_SCALE, shareSupply + VIRTUAL_SHARES_OFFSET, Math.Rounding.Floor);
+    }
+
+    /// @notice Returns the managed assets that still back active shares after excluding pending withdrawals.
+    /// @return activeManagedWad The managed WAD available to active shares.
+    function _activeManagedWad() internal view returns (uint256 activeManagedWad) {
+        return totalManagedWad - totalPendingWithdrawWad;
+    }
+
+    /// @notice Returns and stores the live on-chain token balance for an asset.
+    /// @param asset The asset to sync.
+    /// @param config The storage slot for the asset configuration.
+    /// @return held The liquidity available to the vault for that asset.
+    function _syncTrackedHoldings(address asset, AssetConfig storage config) internal returns (uint256 held) {
+        held = IERC20(asset).balanceOf(address(this));
+        config.totalHeld = held;
+    }
+
+    /// @notice Returns a whitelisted asset configuration or reverts.
+    /// @param asset The asset to validate.
+    /// @return config The storage slot for that asset.
+    function _requireWhitelistedAsset(address asset) internal view returns (AssetConfig storage config) {
+        config = assetConfig[asset];
+        if (!config.enabled) revert AssetNotWhitelisted(asset);
+    }
+
+    /// @notice Removes an asset from `assetList` in O(1) time via swap-and-pop.
+    /// @param asset The asset to remove.
+    function _removeAssetFromList(address asset) internal {
+        uint256 indexPlusOne = _assetIndexPlusOne[asset];
+        uint256 index = indexPlusOne - 1;
+        uint256 lastIndex = assetList.length - 1;
+
+        if (index != lastIndex) {
+            address movedAsset = assetList[lastIndex];
+            assetList[index] = movedAsset;
+            _assetIndexPlusOne[movedAsset] = index + 1;
+        }
+
+        assetList.pop();
+        delete _assetIndexPlusOne[asset];
+    }
+
+    /// @notice Adds a user to the enumerable pending-withdraw set.
+    /// @param user The account with a live pending withdrawal.
+    function _addPendingUser(address user) internal {
+        if (_pendingUserIndexPlusOne[user] != 0) return;
+
+        _pendingUsers.push(user);
+        _pendingUserIndexPlusOne[user] = _pendingUsers.length;
+    }
+
+    /// @notice Removes a user from the enumerable pending-withdraw set.
+    /// @param user The account whose pending withdrawal is being cleared.
+    function _removePendingUser(address user) internal {
+        uint256 indexPlusOne = _pendingUserIndexPlusOne[user];
+        if (indexPlusOne == 0) return;
+
+        uint256 index = indexPlusOne - 1;
+        uint256 lastIndex = _pendingUsers.length - 1;
+
+        if (index != lastIndex) {
+            address movedUser = _pendingUsers[lastIndex];
+            _pendingUsers[index] = movedUser;
+            _pendingUserIndexPlusOne[movedUser] = index + 1;
+        }
+
+        _pendingUsers.pop();
+        delete _pendingUserIndexPlusOne[user];
+    }
+}
