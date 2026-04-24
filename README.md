@@ -1,4 +1,4 @@
-# Stump the Auditor — Base Contracts
+# Stump the AI Auditor — Base Contracts
 
 Three production-style DeFi contracts. Modify one (≤50 lines) to plant a fund-draining vulnerability, then try to slip it past CertiK's AI Auditor Lite. If the scan misses it, submit. Top three stumps win.
 

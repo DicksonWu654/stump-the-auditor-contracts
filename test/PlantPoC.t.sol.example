@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Stump the Auditor — PoC Harness Template
+// Stump the AI Auditor — PoC Harness Template
 //
 // Copy this file to `test/PlantPoC.t.sol` (remove the .example suffix), then:
 //   1. Modify one of the three base contracts (≤50 lines).
