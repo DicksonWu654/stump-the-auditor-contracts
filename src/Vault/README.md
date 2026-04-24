@@ -26,7 +26,7 @@ User:
 - `deposit(asset, amount, receiver) → shares`
 - `requestWithdraw(shares, asset) → unlockBlock`
 - `claimWithdraw() → amountOut` (callable while paused)
-- `cancelWithdraw()` (only before `unlockBlock`; returns original shares)
+- `cancelWithdraw()` (only before `unlockBlock`; restored shares are repriced from the frozen WAD claim at current PPS, not the originally burned share count)
 
 Views: `totalAssets`, `convertToShares`, `convertToAssets`, `previewDeposit`, `previewWithdraw`, `getAssetList`, `getPendingWithdraw`. All preview views simulate a fee accrual.
 
@@ -47,7 +47,7 @@ All admin setters call `_accrueFees()` first so param changes apply forward-only
 | `MAX_MANAGEMENT_FEE_BPS` | 500 | 5% annualized cap |
 | `MAX_PERFORMANCE_FEE_BPS` | 3_000 | 30% cap |
 | `MAX_TIMELOCK_BLOCKS` | ~7 days of blocks | timelock upper bound |
-| `MIN_INITIAL_DEPOSIT` | 1e6 | first-depositor protection |
+| `MIN_INITIAL_DEPOSIT` | 1e18 | first-depositor protection (WAD-denominated) |
 | `VIRTUAL_SHARES_OFFSET` | 1e3 | first-depositor inflation mitigation |
 
 ## Key Invariants

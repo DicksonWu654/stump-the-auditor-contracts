@@ -58,7 +58,7 @@ All admin setters call `_accrueInterest(asset)` first so new params apply forwar
 - **Liquidator receives collateral as an internal supply position, not a direct transfer.** Mirrors Aave v2 "receiveAToken = true". Keeps reserve-balance math simple and eliminates one reentrancy surface.
 - **`collateralAsset != debtAsset`** is required in `liquidate`. Simplifies the case where seized collateral is also the debt being repaid.
 - **Liquidations are blocked while paused.** Emergency pause stops debt repricing from taking place mid-inspection.
-- **Debt-free withdraws skip oracle reads.** If a user has no debt, there's nothing to check HF against, so no price is fetched. Stale-oracle reverts don't affect uncollateralized exits.
+- **Debt-free withdraws skip the health-factor check.** If a user has no debt, HF isn't computed and the debt-side oracle loop doesn't run. Collateral is still valued via the oracle for other paths, so a debt-free user with collateral can still be blocked by a stale oracle on that collateral when HF is computed; a user with zero debt and zero collateral incurs no oracle reads.
 - **Oracle staleness lives in `Lending.sol`, not in the oracle itself.** The oracle returns `(price, updatedAt)`; Lending enforces the freshness gate.
 
 ## Interest Math Contract
