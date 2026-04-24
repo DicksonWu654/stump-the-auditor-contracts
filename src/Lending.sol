@@ -583,7 +583,6 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
             if (scaledBalance == 0) continue;
 
             Reserve memory reserve = _getUpdatedReserve(asset);
-            if (!reserve.useAsCollateral) continue;
 
             uint256 supplyBalance =
                 LendingMath.scaledToUnderlying(scaledBalance, reserve.supplyIndex, Math.Rounding.Floor);

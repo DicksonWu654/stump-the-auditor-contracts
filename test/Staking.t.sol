@@ -146,7 +146,6 @@ contract StakingTest is BaseTest {
     uint128 internal constant LARGE_STAKE = 1_000 ether;
     uint256 internal constant DUST_TOLERANCE = 1_000;
     uint256 internal constant CLAIM_GAS_HISTORY_DELTA_MAX = 20_000;
-    uint256 internal constant PENALTY_REWARD_AGE_BLOCKS = 7_200;
 
     MockERC20 internal stakingToken;
     MockERC20 internal bonusToken;
@@ -280,7 +279,6 @@ contract StakingTest is BaseTest {
 
     function test_flushPenalty_doesNotExtendActiveStream() public {
         _stake(alice, DEFAULT_STAKE, tier30);
-        vm.roll(block.number + 1);
         _stake(bob, DEFAULT_STAKE, tier30);
         _notify(address(stakingToken), 15 ether);
 
@@ -292,7 +290,7 @@ contract StakingTest is BaseTest {
 
         (,,, uint128 oldRewardRate,, uint256 rewardPerTokenStored, uint256 queuedPenalty) =
             staking.rewardData(address(stakingToken));
-        assertEq(queuedPenalty, 10 ether);
+        assertEq(queuedPenalty, 0);
         assertGt(rewardPerTokenStored, 0);
         staking.flushPenalty();
 
@@ -301,7 +299,7 @@ contract StakingTest is BaseTest {
 
         assertEq(postQueuedPenalty, 0);
         assertEq(newPeriodFinish, periodFinishBefore);
-        assertGt(newRewardRate, oldRewardRate);
+        assertEq(newRewardRate, oldRewardRate);
 
         warp(periodFinishBefore - block.timestamp);
 
@@ -321,13 +319,12 @@ contract StakingTest is BaseTest {
         assertEq(stakingToken.balanceOf(bob), type(uint120).max - 10 ether + bobEarned);
     }
 
-    function testEmergencyUnstakeQueuesPenaltyWhenOlderIncumbentEligible() public {
+    function testEmergencyUnstakeDistributesPenaltyImmediatelyWhenEligible() public {
         _stake(alice, DEFAULT_STAKE, tier30);
-        vm.roll(block.number + 1);
         _stake(bob, DEFAULT_STAKE, tier30);
 
         vm.expectEmit(true, true, false, true);
-        emit PenaltyQueued(address(stakingToken), 10 ether);
+        emit PenaltyFlushed(address(stakingToken), 10 ether, 0);
 
         vm.prank(bob);
         staking.emergencyUnstake(0);
@@ -344,40 +341,40 @@ contract StakingTest is BaseTest {
         assertEq(periodFinish, 0);
         assertEq(lastUpdateTime, 0);
         assertEq(rewardRate, 0);
-        assertEq(rewardPerTokenStored, 0);
-        assertEq(queuedPenalty, 10 ether);
+        assertGt(rewardPerTokenStored, 0);
+        assertEq(queuedPenalty, 0);
 
-        assertEq(staking.earned(alice, address(stakingToken)), 0);
+        assertApproxEqAbs(staking.earned(alice, address(stakingToken)), 10 ether, DUST_TOLERANCE);
         assertEq(staking.earned(bob, address(stakingToken)), 0);
     }
 
-    function testEmergencyPenaltyCannotBeCapturedByJustInTimeStaker() public {
+    function testEmergencyPenaltyJustInTimeStakerReceivesDocumentedShare() public {
         _stake(alice, DEFAULT_STAKE, tier30);
-        vm.roll(block.number + 1);
-        _stake(bob, uint128(staking.MIN_STAKE_AMOUNT()), tier30);
+        _stake(bob, DEFAULT_STAKE, tier30);
+        _stake(charlie, DEFAULT_STAKE, tier30);
 
-        vm.prank(alice);
+        vm.prank(charlie);
         staking.emergencyUnstake(0);
 
         (,,,,,, uint256 queuedPenalty) = staking.rewardData(address(stakingToken));
-        assertEq(queuedPenalty, 10 ether);
-        assertEq(staking.earned(bob, address(stakingToken)), 0);
+        assertEq(queuedPenalty, 0);
+
+        // Option A intentionally accepts the R2 JIT limitation: current non-penalized
+        // stakers, including a just-in-time stake, share the immediate penalty bump.
+        assertApproxEqAbs(staking.earned(alice, address(stakingToken)), 5 ether, DUST_TOLERANCE);
+        assertApproxEqAbs(staking.earned(bob, address(stakingToken)), 5 ether, DUST_TOLERANCE);
+        assertEq(staking.earned(charlie, address(stakingToken)), 0);
     }
 
     function testEmergencyPenaltyStillRewardsOlderIncumbent() public {
-        uint256 startBlock = block.number;
         _stake(bob, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + PENALTY_REWARD_AGE_BLOCKS + 1);
         _stake(alice, DEFAULT_STAKE, tier30);
 
         vm.prank(alice);
         staking.emergencyUnstake(0);
 
         (,,,,,, uint256 queuedPenalty) = staking.rewardData(address(stakingToken));
-        assertEq(queuedPenalty, 10 ether);
-
-        staking.flushPenalty();
-        vm.warp(block.timestamp + REWARD_DURATION);
+        assertEq(queuedPenalty, 0);
 
         assertApproxEqAbs(staking.earned(bob, address(stakingToken)), 10 ether, DUST_TOLERANCE);
     }
@@ -386,11 +383,8 @@ contract StakingTest is BaseTest {
         vm.prank(owner);
         uint8 unlockedTier = staking.setLockTier(0, 10_000);
 
-        uint256 startBlock = block.number;
         _stake(alice, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + 1);
         _stake(bob, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + PENALTY_REWARD_AGE_BLOCKS + 2);
         _stake(charlie, DEFAULT_STAKE, unlockedTier);
 
         vm.prank(charlie);
@@ -400,25 +394,19 @@ contract StakingTest is BaseTest {
         staking.emergencyUnstake(0);
 
         (,,,,,, uint256 queuedPenalty) = staking.rewardData(address(stakingToken));
-        assertEq(queuedPenalty, 10 ether);
-
-        staking.flushPenalty();
-        vm.warp(block.timestamp + REWARD_DURATION);
+        assertEq(queuedPenalty, 0);
 
         assertApproxEqAbs(staking.earned(alice, address(stakingToken)), 10 ether, DUST_TOLERANCE);
         assertEq(staking.earned(bob, address(stakingToken)), 0);
         assertEq(staking.earned(charlie, address(stakingToken)), 0);
     }
 
-    function testFlushPenaltyRewardsOlderIncumbentAfterStaleHistorySetup() public {
+    function testEmergencyPenaltyIgnoresWithdrawnStakeHistory() public {
         vm.prank(owner);
         uint8 unlockedTier = staking.setLockTier(0, 10_000);
 
-        uint256 startBlock = block.number;
         _stake(alice, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + 1);
         _stake(bob, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + PENALTY_REWARD_AGE_BLOCKS + 2);
         _stake(charlie, uint128(staking.MIN_STAKE_AMOUNT()), unlockedTier);
 
         vm.prank(charlie);
@@ -429,60 +417,50 @@ contract StakingTest is BaseTest {
 
         _stake(charlie, DEFAULT_STAKE * 9, tier30);
 
-        staking.flushPenalty();
-        vm.warp(block.timestamp + REWARD_DURATION);
-
         assertApproxEqAbs(staking.earned(alice, address(stakingToken)), 10 ether, DUST_TOLERANCE);
         assertEq(staking.earned(charlie, address(stakingToken)), 0);
     }
 
-    function testEmergencyPenaltyQueuesWhenLaterStakeStillActive() public {
-        uint256 startBlock = block.number;
+    function testEmergencyPenaltyDistributesToAllCurrentNonPenalizedStakers() public {
         _stake(alice, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + 1);
         _stake(bob, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + 2);
         _stake(charlie, DEFAULT_STAKE, tier30);
 
         vm.prank(bob);
         staking.emergencyUnstake(0);
 
         (,,,,,, uint256 queuedPenalty) = staking.rewardData(address(stakingToken));
-        assertEq(queuedPenalty, 10 ether);
-        assertEq(staking.earned(alice, address(stakingToken)), 0);
-        assertEq(staking.earned(charlie, address(stakingToken)), 0);
+        assertEq(queuedPenalty, 0);
+        assertApproxEqAbs(staking.earned(alice, address(stakingToken)), 5 ether, DUST_TOLERANCE);
+        assertApproxEqAbs(staking.earned(charlie, address(stakingToken)), 5 ether, DUST_TOLERANCE);
+        assertEq(staking.earned(bob, address(stakingToken)), 0);
     }
 
-    function testEmergencyPenaltyQueuesWhenLaterStakeExitsAndRestakes() public {
+    function testEmergencyPenaltyDistributesToCurrentRestakedUser() public {
         vm.prank(owner);
         uint8 unlockedTier = staking.setLockTier(0, 10_000);
 
-        uint256 startBlock = block.number;
         _stake(alice, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + 1);
         _stake(bob, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + 2);
         _stake(charlie, DEFAULT_STAKE, unlockedTier);
 
         vm.prank(charlie);
         staking.unstake(0);
 
-        vm.roll(startBlock + 3);
         _stake(charlie, DEFAULT_STAKE, tier30);
 
         vm.prank(bob);
         staking.emergencyUnstake(0);
 
         (,,,,,, uint256 queuedPenalty) = staking.rewardData(address(stakingToken));
-        assertEq(queuedPenalty, 10 ether);
-        assertEq(staking.earned(alice, address(stakingToken)), 0);
-        assertEq(staking.earned(charlie, address(stakingToken)), 0);
+        assertEq(queuedPenalty, 0);
+        assertApproxEqAbs(staking.earned(alice, address(stakingToken)), 5 ether, DUST_TOLERANCE);
+        assertApproxEqAbs(staking.earned(charlie, address(stakingToken)), 5 ether, DUST_TOLERANCE);
+        assertEq(staking.earned(bob, address(stakingToken)), 0);
     }
 
     function testEmergencyPenaltyCannotBeCapturedByLateStaker() public {
-        uint256 startBlock = block.number;
         _stake(bob, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + PENALTY_REWARD_AGE_BLOCKS + 1);
         _stake(alice, DEFAULT_STAKE, tier30);
 
         vm.prank(alice);
@@ -490,10 +468,28 @@ contract StakingTest is BaseTest {
 
         _stake(charlie, DEFAULT_STAKE * 9, tier30);
         staking.flushPenalty();
-        vm.warp(block.timestamp + REWARD_DURATION);
 
         assertApproxEqAbs(staking.earned(bob, address(stakingToken)), 10 ether, DUST_TOLERANCE);
         assertEq(staking.earned(charlie, address(stakingToken)), 0);
+    }
+
+    function testAdminPrimaryRewardUsesFullSupplyAfterPriorPenaltyFlush() public {
+        _stake(alice, DEFAULT_STAKE, tier30);
+
+        vm.prank(alice);
+        staking.emergencyUnstake(0);
+
+        _stake(bob, DEFAULT_STAKE, tier30);
+        staking.flushPenalty();
+
+        warp(REWARD_DURATION);
+        _stake(charlie, DEFAULT_STAKE, tier30);
+        _notify(address(stakingToken), 30 ether);
+
+        warp(12 hours);
+
+        assertApproxEqAbs(staking.earned(bob, address(stakingToken)), 10.25 ether, DUST_TOLERANCE);
+        assertApproxEqAbs(staking.earned(charlie, address(stakingToken)), 0.25 ether, DUST_TOLERANCE);
     }
 
     function test_flushPenalty_revertsBelowMin() public {
@@ -1307,9 +1303,6 @@ contract StakingTest is BaseTest {
     }
 
     function testFlushPenaltyOverflowDoesNotExtendActiveStream() public {
-        uint256 startBlock = block.number;
-        _stake(bob, DEFAULT_STAKE, tier30);
-        vm.roll(startBlock + PENALTY_REWARD_AGE_BLOCKS + 1);
         _stake(alice, 4_000 ether, tier30);
         _notify(address(stakingToken), 1 ether);
 

@@ -86,7 +86,7 @@ Synthetix `StakingRewards` × MasterChef × veToken-lite. Users stake one token 
 
 **Key invariants:**
 - `primaryRewardToken == stakingToken` always (enforced in constructor and `setPrimaryRewardToken`)
-- Early-unstake penalty queues in `primaryRewardToken`'s `queuedPenalty`; `flushPenalty()` moves it into the reward stream WITHOUT extending `periodFinish` (if a stream is active, it's folded into remaining duration)
+- Early-unstake penalties redistribute immediately to current non-penalized stakers; if no eligible staker exists, the penalty queues in `primaryRewardToken`'s `queuedPenalty` and `flushPenalty()` moves it into the reward stream WITHOUT extending `periodFinish`
 - `_updateRewardAll(user)` MUST run before any mutation of `_userBoostedAmount[user]` / `totalBoostedSupply` — it snapshots reward accumulator state
 - `compound()` zeros reward balance before staking — no double-count; primary token already in contract, no transfer
 - Per-user active stake count + boosted amount tracked in storage (O(1) reward-update reads)

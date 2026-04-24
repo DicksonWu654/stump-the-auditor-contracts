@@ -295,6 +295,47 @@ contract LendingTest is BaseTest {
         assertEq(withdrawn, 1e8);
     }
 
+    function testCollateralDisableDoesNotRemoveExistingCollateralFromHealthFactor() public {
+        _supply(bob, usdc, 2_000e6, bob);
+        _supply(alice, weth, 1 ether, alice);
+        _borrow(alice, usdc, 1_000e6, alice);
+
+        (,,, uint256 healthFactorBefore) = lending.getUserAccountData(alice);
+        assertGt(healthFactorBefore, lending.MIN_HEALTH_FACTOR());
+        assertTrue(_contains(lending.getUserCollateralAssets(alice), address(weth)));
+
+        vm.prank(owner);
+        lending.setCollateralEnabled(address(weth), false);
+
+        (,,, uint256 healthFactorAfter) = lending.getUserAccountData(alice);
+        assertEq(healthFactorAfter, healthFactorBefore);
+        assertGt(healthFactorAfter, lending.MIN_HEALTH_FACTOR());
+        assertTrue(_contains(lending.getUserCollateralAssets(alice), address(weth)));
+
+        vm.expectRevert(abi.encodeWithSelector(ILendingPool.HealthFactorNotBelowThreshold.selector, healthFactorAfter));
+        vm.prank(charlie);
+        lending.liquidate(alice, address(weth), address(usdc), 500e6);
+
+        _repay(alice, usdc, type(uint256).max, alice);
+        _withdraw(alice, weth, type(uint256).max, alice);
+
+        (uint256 supplyBalance,) = lending.getUserReserveData(alice, address(weth));
+        (, uint256 borrowBalance) = lending.getUserReserveData(alice, address(usdc));
+        assertEq(supplyBalance, 0);
+        assertEq(borrowBalance, 0);
+    }
+
+    function testSupplyWhileCollateralDisabledDoesNotRegisterCollateralAsset() public {
+        vm.prank(owner);
+        lending.setCollateralEnabled(address(wbtc), false);
+
+        _supply(alice, wbtc, 1e8, alice);
+
+        address[] memory collateralAssets = lending.getUserCollateralAssets(alice);
+        assertEq(collateralAssets.length, 0);
+        assertFalse(_contains(collateralAssets, address(wbtc)));
+    }
+
     function testPartialLiquidationAtFullCloseFactorLeavesBorrowerHealthy() public {
         vm.prank(owner);
         lending.setCloseFactor(10_000);
