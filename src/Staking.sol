@@ -250,11 +250,12 @@ contract Staking is IStaking, Ownable2Step, ReentrancyGuard, Pausable {
         if (rewardToken != address(stakingToken)) revert CompoundRequiresStakingTokenReward();
         if (!rewardData[rewardToken].enabled) revert PrimaryRewardNotListed(rewardToken);
 
-        _updateRewardGlobal(rewardToken);
-
         RewardData storage reward = rewardData[rewardToken];
         uint256 amount = reward.queuedPenalty;
-        if (amount == 0) return;
+        if (amount == 0) revert NoQueuedPenalty();
+
+        _updateRewardGlobal(rewardToken);
+
         if (amount < MIN_FLUSH_PENALTY_AMOUNT) revert PenaltyAmountTooLow(amount, MIN_FLUSH_PENALTY_AMOUNT);
 
         uint64 currentTime = _currentTime();

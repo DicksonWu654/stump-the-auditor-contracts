@@ -277,20 +277,27 @@ contract StakingTest is BaseTest {
         assertEq(stakingToken.balanceOf(alice), type(uint120).max - 10 ether);
     }
 
+    function test_flushPenalty_revertsWhenNoPenaltyQueued() public {
+        _stake(alice, DEFAULT_STAKE, tier30);
+        _notify(address(stakingToken), 1 ether);
+
+        vm.expectRevert(IStaking.NoQueuedPenalty.selector);
+        staking.flushPenalty();
+    }
+
     function test_flushPenalty_doesNotExtendActiveStream() public {
         _stake(alice, DEFAULT_STAKE, tier30);
-        _stake(bob, DEFAULT_STAKE, tier30);
         _notify(address(stakingToken), 15 ether);
 
         (, uint64 periodFinishBefore,,,,,) = staking.rewardData(address(stakingToken));
         warp(10 days);
 
-        vm.prank(bob);
+        vm.prank(alice);
         staking.emergencyUnstake(0);
 
         (,,, uint128 oldRewardRate,, uint256 rewardPerTokenStored, uint256 queuedPenalty) =
             staking.rewardData(address(stakingToken));
-        assertEq(queuedPenalty, 0);
+        assertEq(queuedPenalty, 10 ether);
         assertGt(rewardPerTokenStored, 0);
         staking.flushPenalty();
 
@@ -299,24 +306,18 @@ contract StakingTest is BaseTest {
 
         assertEq(postQueuedPenalty, 0);
         assertEq(newPeriodFinish, periodFinishBefore);
-        assertEq(newRewardRate, oldRewardRate);
+        assertGt(newRewardRate, oldRewardRate);
 
         warp(periodFinishBefore - block.timestamp);
 
         uint256 aliceEarned = staking.earned(alice, address(stakingToken));
-        uint256 bobEarned = staking.earned(bob, address(stakingToken));
 
-        assertApproxEqAbs(aliceEarned, 22.5 ether, DUST_TOLERANCE);
-        assertApproxEqAbs(bobEarned, 2.5 ether, DUST_TOLERANCE);
+        assertApproxEqAbs(aliceEarned, 5 ether, DUST_TOLERANCE);
 
         vm.prank(alice);
         staking.claim(address(stakingToken));
 
-        vm.prank(bob);
-        staking.claim(address(stakingToken));
-
-        assertEq(stakingToken.balanceOf(alice), type(uint120).max - DEFAULT_STAKE + aliceEarned);
-        assertEq(stakingToken.balanceOf(bob), type(uint120).max - 10 ether + bobEarned);
+        assertEq(stakingToken.balanceOf(alice), type(uint120).max - 10 ether + aliceEarned);
     }
 
     function testEmergencyUnstakeDistributesPenaltyImmediatelyWhenEligible() public {
@@ -467,7 +468,6 @@ contract StakingTest is BaseTest {
         staking.emergencyUnstake(0);
 
         _stake(charlie, DEFAULT_STAKE * 9, tier30);
-        staking.flushPenalty();
 
         assertApproxEqAbs(staking.earned(bob, address(stakingToken)), 10 ether, DUST_TOLERANCE);
         assertEq(staking.earned(charlie, address(stakingToken)), 0);

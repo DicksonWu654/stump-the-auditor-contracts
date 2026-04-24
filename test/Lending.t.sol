@@ -876,6 +876,22 @@ contract LendingTest is BaseTest {
         assertLt(bobCollateralAfter, 1 ether);
     }
 
+    function testBorrowRequiresCurrentlyEnabledCollateralCapacity() public {
+        _supply(alice, usdc, 2_000e6, alice);
+        _supply(bob, weth, 1 ether, bob);
+
+        vm.prank(owner);
+        lending.setCollateralEnabled(address(weth), false);
+
+        (uint256 collateralValue,, uint256 availableBorrows,) = lending.getUserAccountData(bob);
+        assertEq(collateralValue, 2_000e18);
+        assertGt(availableBorrows, 0);
+
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(ILendingPool.HealthFactorBelowThreshold.selector, 0));
+        lending.borrow(address(usdc), 1e6, bob);
+    }
+
     function testLiquidationCannotSeizeSupplyNeverEnabledAsCollateral() public {
         vm.prank(owner);
         lending.setCollateralEnabled(address(wbtc), false);

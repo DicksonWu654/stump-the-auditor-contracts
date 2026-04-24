@@ -795,8 +795,8 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     function _requireWithinBorrowCapacity(address user) internal view {
-        (, uint256 totalDebtValueWad, uint256 availableBorrowsWad,) = _getUserAccountData(user);
-        if (totalDebtValueWad != 0 && availableBorrowsWad == 0) {
+        (, uint256 totalDebtValueWad,,) = _getUserAccountData(user);
+        if (totalDebtValueWad != 0) {
             uint256 collateralCapacityWad;
             address[] storage collateralAssets = userCollateralAssets[user];
             for (uint256 i; i < collateralAssets.length; ++i) {

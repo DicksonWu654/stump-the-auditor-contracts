@@ -54,6 +54,7 @@ interface IStaking {
     error RewardDurationOutOfRange(uint256 provided, uint256 min, uint256 max);
     error RewardAmountTooLow(uint256 provided, uint256 min);
     error PenaltyAmountTooLow(uint256 provided, uint256 minimum);
+    error NoQueuedPenalty();
     error PenaltyTooHigh(uint256 provided, uint256 max);
     error BoostOutOfRange(uint32 provided, uint256 min, uint256 max);
     error CannotRecoverStakingToken();
