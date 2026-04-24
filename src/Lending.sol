@@ -118,7 +118,7 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         userScaledSupply[onBehalfOf][asset] += scaledAmount;
         reserve.totalScaledSupply = (uint256(reserve.totalScaledSupply) + scaledAmount).toUint128();
 
-        if (reserve.useAsCollateral && !_hasCollateral[onBehalfOf][asset]) {
+        if (reserve.useAsCollateral && !_hasCollateral[onBehalfOf][asset] && msg.sender == onBehalfOf) {
             _hasCollateral[onBehalfOf][asset] = true;
             userCollateralAssets[onBehalfOf].push(asset);
         }

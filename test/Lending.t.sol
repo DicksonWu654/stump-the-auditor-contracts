@@ -486,15 +486,56 @@ contract LendingTest is BaseTest {
         assertEq(collateralAssets[0], address(usdc));
     }
 
-    function testSupplyOnBehalfRegistersCollateralForBeneficiary() public {
+    function testThirdPartyStaleCollateralDustDoesNotBlockLiquidation() public {
+        _supply(alice, usdc, 2_000e6, alice);
+        _supply(bob, weth, 1 ether, bob);
+        _borrow(bob, usdc, 1_000e6, bob);
+
+        advanceSeconds(lending.MAX_ORACLE_STALENESS() + 1);
+        vm.startPrank(owner);
+        oracle.setPrice(address(usdc), USDC_PRICE);
+        oracle.setPrice(address(weth), 1_000e8);
+        vm.stopPrank();
+
+        _supply(charlie, wbtc, 1, bob);
+
+        address[] memory collateralAssets = lending.getUserCollateralAssets(bob);
+        assertFalse(_contains(collateralAssets, address(wbtc)));
+        (uint256 wbtcSupply,) = lending.getUserReserveData(bob, address(wbtc));
+        assertEq(wbtcSupply, 1);
+
+        vm.prank(charlie);
+        (uint256 debtRepaid, uint256 collateralSeized) = lending.liquidate(bob, address(weth), address(usdc), 500e6);
+
+        assertEq(debtRepaid, 500e6);
+        assertGt(collateralSeized, 0);
+    }
+
+    function testOwnSupplyOfStaleAssetStillEnablesCollateral() public {
+        advanceSeconds(lending.MAX_ORACLE_STALENESS() + 1);
+
+        _supply(bob, wbtc, 1, bob);
+
+        address[] memory collateralAssets = lending.getUserCollateralAssets(bob);
+        assertTrue(_contains(collateralAssets, address(wbtc)));
+        (uint256 wbtcSupply,) = lending.getUserReserveData(bob, address(wbtc));
+        assertEq(wbtcSupply, 1);
+    }
+
+    function testSupplyOnBehalfCreditsBeneficiaryWhenCollateralAlreadyEnabled() public {
         _supply(alice, usdc, 1_000e6, alice);
+        _supply(bob, weth, 1, bob);
 
         vm.prank(alice);
         lending.supply(address(weth), 1 ether, bob);
 
         (uint256 collateralValue,, uint256 availableBorrows,) = lending.getUserAccountData(bob);
-        assertEq(collateralValue, 2_000e18);
+        assertEq(collateralValue, 2_000e18 + 2_000);
         assertGt(availableBorrows, 0);
+
+        address[] memory collateralAssets = lending.getUserCollateralAssets(bob);
+        assertEq(collateralAssets.length, 1);
+        assertEq(collateralAssets[0], address(weth));
 
         vm.prank(bob);
         lending.borrow(address(usdc), 500e6, bob);
@@ -1154,6 +1195,14 @@ contract LendingTest is BaseTest {
     function _withdraw(address user, MockERC20 token, uint256 amount, address to) internal {
         vm.prank(user);
         lending.withdraw(address(token), amount, to);
+    }
+
+    function _contains(address[] memory assets, address asset) internal pure returns (bool) {
+        for (uint256 i; i < assets.length; ++i) {
+            if (assets[i] == asset) return true;
+        }
+
+        return false;
     }
 
     function _expectUnauthorized(address caller, bytes memory data) internal {
