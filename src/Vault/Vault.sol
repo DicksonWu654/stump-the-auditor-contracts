@@ -81,6 +81,8 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     address[] private _pendingUsers;
     mapping(address => uint256) private _pendingUserIndexPlusOne;
 
+    uint256 private _deferredFeeShares;
+
     /// @notice Sets the initial fee recipient and fee parameters.
     /// @param feeRecipient_ The address that receives fee shares.
     /// @param performanceFeeBps_ The initial performance fee, in basis points.
@@ -125,6 +127,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
 
         AssetConfig storage config = _requireWhitelistedAsset(asset);
         _accrueFees(asset);
+        _flushDeferredFees();
         _setOrCheckShareAsset(receiver, asset);
 
         bool initializingSupply = totalShares == 0;
@@ -185,6 +188,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         if (shares > availableShares) revert InsufficientShares(shares, availableShares);
 
         uint256 wadOwed = _computeAssets(shares, totalShares, _activeManagedWad());
+        _flushDeferredFees();
         uint256 reservedAmount = _fromWad(wadOwed, config.decimals);
         if (wadOwed != 0 && reservedAmount == 0) revert ZeroAmount();
         uint256 effectiveWadOwed = _toWad(reservedAmount, config.decimals);
@@ -222,6 +226,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         if (request.shares == 0) revert NoPendingWithdraw(msg.sender);
         if (block.number < request.unlockBlock) revert TimelockActive(request.unlockBlock, uint64(block.number));
         _accrueFees(address(0));
+        _flushDeferredFees();
 
         AssetConfig storage config = assetConfig[request.asset];
         uint256 availableLiquidity = _syncTrackedHoldings(request.asset, config);
@@ -253,6 +258,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         if (block.number >= request.unlockBlock) revert TimelockActive(request.unlockBlock, uint64(block.number));
 
         _accrueFees(address(0));
+        _flushDeferredFees();
 
         uint256 activeManagedWad = _activeManagedWad();
         uint256 newShares = totalShares == 0 && activeManagedWad == 0
@@ -351,6 +357,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param asset The ERC20 asset to whitelist.
     function addAsset(address asset) external onlyOwner {
         _accrueFees(address(0));
+        _flushDeferredFees();
 
         if (asset == address(0)) revert ZeroAddress();
         if (assetConfig[asset].enabled) revert AssetAlreadyWhitelisted(asset);
@@ -372,6 +379,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param asset The whitelisted asset to remove.
     function removeAsset(address asset) external onlyOwner {
         _accrueFees(address(0));
+        _flushDeferredFees();
 
         AssetConfig storage config = _requireWhitelistedAsset(asset);
         uint256 outstandingShares = sharesByAsset[asset];
@@ -391,6 +399,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param bps The new performance fee, in basis points.
     function setPerformanceFee(uint256 bps) external onlyOwner {
         _accrueFees(address(0));
+        _flushDeferredFees();
 
         if (bps > MAX_PERFORMANCE_FEE_BPS) revert FeeTooHigh(bps, MAX_PERFORMANCE_FEE_BPS);
         performanceFeeBps = bps;
@@ -402,6 +411,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param bps The new management fee, in basis points.
     function setManagementFee(uint256 bps) external onlyOwner {
         _accrueFees(address(0));
+        _flushDeferredFees();
 
         if (bps > MAX_MANAGEMENT_FEE_BPS) revert FeeTooHigh(bps, MAX_MANAGEMENT_FEE_BPS);
         managementFeeBps = bps;
@@ -413,6 +423,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param blocks_ The new timelock, in blocks.
     function setTimelockBlocks(uint256 blocks_) external onlyOwner {
         _accrueFees(address(0));
+        _flushDeferredFees();
 
         if (blocks_ > MAX_TIMELOCK_BLOCKS) revert TimelockTooLong(blocks_, MAX_TIMELOCK_BLOCKS);
         timelockBlocks = blocks_;
@@ -425,6 +436,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param recipient The new fee recipient.
     function setFeeRecipient(address recipient) external onlyOwner {
         _accrueFees(address(0));
+        _flushDeferredFees();
 
         if (recipient == address(0)) revert ZeroAddress();
         feeRecipient = recipient;
@@ -439,6 +451,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param amount The token-native profit amount to pull from the owner.
     function reportYield(address asset, uint256 amount) external onlyOwner {
         _accrueFees(asset);
+        _flushDeferredFees();
 
         if (amount == 0) revert ZeroAmount();
         uint256 activeManagedWad = _activeManagedWad();
@@ -464,17 +477,20 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Accrues any pending management and performance fees.
     function accrueFees() external {
         _accrueFees(address(0));
+        _flushDeferredFees();
     }
 
     /// @notice Pauses new exposure-creating entry points.
     function pause() external onlyOwner {
         _accrueFees(address(0));
+        _flushDeferredFees();
         _pause();
     }
 
     /// @notice Unpauses new exposure-creating entry points.
     function unpause() external onlyOwner {
         _accrueFees(address(0));
+        _flushDeferredFees();
         _unpause();
     }
 
@@ -482,9 +498,16 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
     /// @dev PPS is measured against active managed assets only, excluding timelocked withdrawal liabilities, so deposits,
     ///      cancellations, and claim finalization preserve PPS up to round-down dust instead of appearing as new profit.
     ///      Pending withdrawals are fixed claims, leaving this path to price only active managed assets.
+    function _flushDeferredFees() internal {
+        uint256 pending = _deferredFeeShares;
+        if (pending == 0) return;
+        totalShares += pending;
+        _deferredFeeShares = 0;
+    }
+
     function _accrueFees(address) internal {
         uint256 currentTime = block.timestamp;
-        if (totalShares == 0) {
+        if (totalShares + _deferredFeeShares == 0) {
             lastFeeAccrual = currentTime;
             if (totalPendingWithdrawWad == 0 && totalManagedWad == 0) {
                 highWaterMarkPPS = 0;
@@ -496,9 +519,8 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 feeShares = mgmtFeeShares + perfFeeShares;
 
         if (feeShares != 0) {
-            // Fee shares are asset-agnostic until the recipient chooses a settlement asset on requestWithdraw().
             _unboundFeeShares[feeRecipient] += feeShares;
-            totalShares += feeShares;
+            _deferredFeeShares += feeShares;
         }
         if (newHighWaterMarkPPS > highWaterMarkPPS) {
             highWaterMarkPPS = newHighWaterMarkPPS;
@@ -529,7 +551,7 @@ contract Vault is IVault, Ownable2Step, ReentrancyGuard, Pausable {
         )
     {
         activeManagedWad = _activeManagedWad();
-        effectiveTotalShares = totalShares;
+        effectiveTotalShares = totalShares + _deferredFeeShares;
         newHighWaterMarkPPS = highWaterMarkPPS;
 
         if (effectiveTotalShares == 0) return (activeManagedWad, effectiveTotalShares, 0, 0, newHighWaterMarkPPS);
